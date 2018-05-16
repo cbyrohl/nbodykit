@@ -115,6 +115,42 @@ class MeshSlab(object):
         """
         return sum(self.coords(i)**2 for i in range(self.ndim))
 
+    def norm2_para(self, los):
+        """
+        The parallel norm component squared defined at each point on the slab
+        for the specified line-of-sight index
+
+        Parameters
+        ----------
+        los: array_like,
+            the direction of the line-of-sight, which `mu` is defined
+            with respect to; must have a norm of 1.
+
+        Returns
+        -------
+        array_like, (slab.shape)
+            the `norm2_para` value at each point in the slab
+        """
+        return sum((self.coords(i)*los[i])**2 for i in range(self.ndim))
+
+    def norm2_perp(self, los):
+        """
+        The perpendicular norm component squared defined at each point on 
+        the slab for the specified line-of-sight index
+
+        Parameters
+        ----------
+        los: array_like,
+            the direction of the line-of-sight, which `mu` is defined
+            with respect to; must have a norm of 1.
+
+        Returns
+        -------
+        array_like, (slab.shape)
+            the `norm2_perp` value at each point in the slab
+        """
+        return self.norm2()-self.norm2_para(los)
+
     def mu(self, los):
         """
         The `mu` value defined at each point on the slab for the

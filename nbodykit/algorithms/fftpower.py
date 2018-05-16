@@ -161,8 +161,9 @@ class FFTPower(FFTBase):
         the source for the first field; if a CatalogSource is provided, it
         is automatically converted to MeshSource using the default painting
         parameters (via :func:`~nbodykit.base.catalogmesh.CatalogMesh.to_mesh`)
-    mode : {'1d', '2d'}
-        compute either 1d or 2d power spectra
+    mode : {'1d', '2d', '2dks'}
+        compute either 1d or 2d power spectra. Last option for dimensionally split k
+        w.r.t. the line of sight.
     Nmesh : int, optional
         the number of cells per side in the particle mesh used to paint the source
     BoxSize : int, 3-vector, optional
@@ -188,9 +189,9 @@ class FFTPower(FFTBase):
     def __init__(self, first, mode, Nmesh=None, BoxSize=None, second=None,
                     los=[0, 0, 1], Nmu=5, dk=None, kmin=0., poles=[]):
 
-        # mode is either '1d' or '2d'
-        if mode not in ['1d', '2d']:
-            raise ValueError("`mode` should be either '1d' or '2d'")
+        # mode is either '1d', '2d' or '2dks'
+        if mode not in ['1d', '2d', '2dks']:
+            raise ValueError("`mode` should be either '1d', '2d', '2dks'")
 
         if poles is None:
             poles = []
@@ -287,16 +288,24 @@ class FFTPower(FFTBase):
 
         # project on to the desired basis
         muedges = numpy.linspace(0, 1, self.attrs['Nmu']+1, endpoint=True)
-        edges = [kedges, muedges]
-        result, pole_result = project_to_basis(y3d, edges,
-                                               poles=self.attrs['poles'],
-                                               los=self.attrs['los'])
+        if self.attrs['mode'] == "2dks":
+            edges = [kedges, kedges]
+            result = project_to_2dks(y3d, edges, los=self.attrs['los'])
+            pole_result = None
+        else:
+            edges = [kedges, muedges]
+            result, pole_result = project_to_basis(y3d, edges,
+                                                   poles=self.attrs['poles'],
+                                                   los=self.attrs['los'])
 
         # format the power results into structured array
         if self.attrs['mode'] == "1d":
             cols = ['k', 'power', 'modes']
             icols = [0, 2, 3]
             edges = edges[0]
+        elif self.attrs['mode'] == "2dks":
+            cols = ['kpara', 'kperp', 'power', 'modes']
+            icols = [0, 1, 2, 3]
         else:
             cols = ['k', 'mu', 'power', 'modes']
             icols = [0, 1, 2, 3]
@@ -342,6 +351,8 @@ class FFTPower(FFTBase):
 
         if self.attrs['mode'] == '1d':
             self.power = BinnedStatistic(['k'], [self.edges], self.power, fields_to_sum=['modes'], **self.attrs)
+        elif self.attrs['mode'] == '2dks':
+            self.power = BinnedStatistic(['kpara', 'kperp'], self.edges, self.power, fields_to_sum=['modes'], **self.attrs)
         else:
             self.power = BinnedStatistic(['k', 'mu'], self.edges, self.power, fields_to_sum=['modes'], **self.attrs)
         if self.poles is not None:
@@ -544,6 +555,166 @@ class ProjectedFFTPower(FFTBase):
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.power = BinnedStatistic(['k'], [self.edges], self.power)
+
+
+def project_to_2dks(y3d, edges, los=[0, 0, 1]):
+    """
+    Project a 3D statistic on to dimensionally split into parallel and
+    perpendicular direction.
+
+    Parameters
+    ----------
+    y3d : RealField or ComplexField
+        the 3D array holding the statistic to be projected to the specified basis
+    edges : list of arrays, (2,)
+        list of arrays specifying the edges of the desired `xpara` bins and `xperp` bins
+    los : array_like,
+        the line-of-sight direction to use, which `xpara` is defined with
+        respect to; default is [0, 0, 1] for z.
+    hermitian_symmetric : bool, optional
+        Whether the input array `y3d` is Hermitian-symmetric, i.e., the negative
+        frequency terms are just the complex conjugates of the corresponding
+        positive-frequency terms; if ``True``, the positive frequency terms
+        will be explicitly double-counted to account for this symmetry
+
+    Returns
+    -------
+    result : tuple
+        the 2D binned results; a tuple of ``(xparamean_2d, xperpmean_2d, y2d, N_2d)``, where:
+
+        - xparamean_2d : array_like, (Nxpara, Nxperp)
+            the mean `x` value in each 2D bin
+        - xperpmean_2d : array_like, (Nxpara, Nxperp)
+            the mean `mu` value in each 2D bin
+        - y2d : array_like, (Nx, Nmu)
+            the mean `y3d` value in each 2D bin
+        - N_2d : array_like, (Nx, Nmu)
+            the number of values averaged in each 2D bin
+    """
+    comm = y3d.pm.comm
+    x3d = y3d.x
+    hermitian_symmetric = numpy.iscomplexobj(y3d)
+
+    from scipy.special import legendre
+
+    # setup the bin edges and number of bins
+    xparaedges, xperpedges = edges
+    xpara2edges = xparaedges**2
+    xperp2edges = xperpedges**2
+    Nxpara = len(xparaedges) - 1
+    Nxperp = len(xperpedges) - 1
+
+    # always make sure first ell value is monopole, which
+    # is just (x, mu) projection since legendre of ell=0 is 1
+    _poles = [0]
+    legpoly = [legendre(l) for l in _poles]
+
+
+
+    # initialize the binning arrays
+    xperpsum = numpy.zeros((Nxpara+2, Nxperp+2))
+    xparasum = numpy.zeros((Nxpara+2, Nxperp+2))
+    ysum = numpy.zeros((Nxpara+2, Nxperp+2), dtype=y3d.dtype)
+    Nsum = numpy.zeros((Nxpara+2, Nxperp+2), dtype='i8')
+
+    # if input array is Hermitian symmetric, only half of the last
+    # axis is stored in `y3d`
+    symmetry_axis = -1 if hermitian_symmetric else None
+
+    # iterate over y-z planes of the coordinate mesh
+    for slab in SlabIterator(x3d, axis=0, symmetry_axis=symmetry_axis):
+
+        # the square of coordinate mesh norm
+        # (either Fourier space k or configuraton space x)
+        xslab = slab.norm2()
+        xparaslab = slab.norm2_para(los)
+        xperpslab = xslab-xparaslab
+
+        mu = slab.mu(los)
+
+        # if empty, do nothing
+        if len(xslab.flat) == 0: continue
+
+        # get the bin indices for x on both slab
+        dig_xpara = numpy.digitize(xparaslab.flat, xpara2edges)
+        dig_xperp = numpy.digitize(xperpslab.flat, xperp2edges)
+
+        # make both xslab just x
+        xparaslab **= 0.5
+        xperpslab **= 0.5
+
+        # make the multi-index
+        multi_index = numpy.ravel_multi_index([dig_xpara, dig_xperp], (Nxpara+2,Nxperp+2))
+
+        # sum up both x components in each bin (accounting for negative freqs)
+        xparaslab[:] *= slab.hermitian_weights
+        xperpslab[:] *= slab.hermitian_weights
+        xparasum.flat += numpy.bincount(multi_index, weights=xparaslab.flat, minlength=xparasum.size)
+        xperpsum.flat += numpy.bincount(multi_index, weights=xperpslab.flat, minlength=xperpsum.size)
+
+        # compute multipoles by weighting by Legendre(ell, mu)
+        for iell, ell in enumerate(_poles):
+
+            # weight the input 3D array by the appropriate Legendre polynomial
+            weighted_y3d = legpoly[iell](mu) * y3d[slab.index]
+
+            # add conjugate for this kx, ky, kz, corresponding to
+            # the (-kx, -ky, -kz) --> need to make mu negative for conjugate
+            # Below is identical to the sum of
+            # Leg(ell)(+mu) * y3d[:, nonsingular]    (kx, ky, kz)
+            # Leg(ell)(-mu) * y3d[:, nonsingular].conj()  (-kx, -ky, -kz)
+            # or
+            # weighted_y3d[:, nonsingular] += (-1)**ell * weighted_y3d[:, nonsingular].conj()
+            # but numerically more accurate.
+            if hermitian_symmetric:
+
+                if ell % 2: # odd, real part cancels
+                    weighted_y3d.real[slab.nonsingular] = 0.
+                    weighted_y3d.imag[slab.nonsingular] *= 2.
+                else:  # even, imag part cancels
+                    weighted_y3d.real[slab.nonsingular] *= 2.
+                    weighted_y3d.imag[slab.nonsingular] = 0.
+
+            # sum up the weighted y in each bin
+            weighted_y3d *= (2.*ell + 1.)
+            ysum[...].real.flat += numpy.bincount(multi_index, weights=weighted_y3d.real.flat, minlength=Nsum.size)
+            if numpy.iscomplexobj(ysum):
+                ysum[...].imag.flat += numpy.bincount(multi_index, weights=weighted_y3d.imag.flat, minlength=Nsum.size)
+
+ 
+
+        # count number of modes in each bin (accounting for negative freqs)
+        Nslab = numpy.ones_like(xslab) * slab.hermitian_weights
+        Nsum.flat += numpy.bincount(multi_index, weights=Nslab.flat, minlength=Nsum.size)
+
+    # sum binning arrays across all ranks
+    xparasum  = comm.allreduce(xparasum)
+    xperpsum = comm.allreduce(xperpsum)
+    ysum  = comm.allreduce(ysum)
+    Nsum  = comm.allreduce(Nsum)
+
+    # Unsure this is necessary to translate coming from project_to_basis
+    ## add the last 'internal' mu bin (mu == 1) to the last visible mu bin
+    ## this makes the last visible mu bin inclusive on both ends.
+    #ysum[..., -2] += ysum[..., -1]
+    #musum[:, -2]  += musum[:, -1]
+    #xsum[:, -2]   += xsum[:, -1]
+    #Nsum[:, -2]   += Nsum[:, -1]
+
+    # reshape and slice to remove out of bounds points
+    sl = slice(1, -1)
+    with numpy.errstate(invalid='ignore'):
+
+        # 2D binned results
+        y2d       = (ysum / Nsum)[sl,sl] 
+        xparamean_2d  = (xparasum / Nsum)[sl,sl]
+        xperpmean_2d = (xperpsum / Nsum)[sl, sl]
+        N_2d      = Nsum[sl,sl]
+
+    # return y(x,mu) + (possibly empty) multipoles
+    result = (xparamean_2d, xperpmean_2d, y2d, N_2d)
+    return result
+
 
 def project_to_basis(y3d, edges, los=[0, 0, 1], poles=[]):
     """

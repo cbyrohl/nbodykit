@@ -604,12 +604,6 @@ def project_to_2dks(y3d, edges, los=[0, 0, 1]):
     Nxpara = len(xparaedges) - 1
     Nxperp = len(xperpedges) - 1
 
-    # always make sure first ell value is monopole, which
-    # is just (x, mu) projection since legendre of ell=0 is 1
-    _poles = [0]
-    legpoly = [legendre(l) for l in _poles]
-
-
 
     # initialize the binning arrays
     xperpsum = numpy.zeros((Nxpara+2, Nxperp+2))
@@ -652,34 +646,15 @@ def project_to_2dks(y3d, edges, los=[0, 0, 1]):
         xparasum.flat += numpy.bincount(multi_index, weights=xparaslab.flat, minlength=xparasum.size)
         xperpsum.flat += numpy.bincount(multi_index, weights=xperpslab.flat, minlength=xperpsum.size)
 
-        # compute multipoles by weighting by Legendre(ell, mu)
-        for iell, ell in enumerate(_poles):
+        weighted_y3d = y3d[slab.index]
+        if hermitian_symmetric:
+            weighted_y3d.real[slab.nonsingular] *= 2.
+            weighted_y3d.imag[slab.nonsingular] = 0.
 
-            # weight the input 3D array by the appropriate Legendre polynomial
-            weighted_y3d = legpoly[iell](mu) * y3d[slab.index]
-
-            # add conjugate for this kx, ky, kz, corresponding to
-            # the (-kx, -ky, -kz) --> need to make mu negative for conjugate
-            # Below is identical to the sum of
-            # Leg(ell)(+mu) * y3d[:, nonsingular]    (kx, ky, kz)
-            # Leg(ell)(-mu) * y3d[:, nonsingular].conj()  (-kx, -ky, -kz)
-            # or
-            # weighted_y3d[:, nonsingular] += (-1)**ell * weighted_y3d[:, nonsingular].conj()
-            # but numerically more accurate.
-            if hermitian_symmetric:
-
-                if ell % 2: # odd, real part cancels
-                    weighted_y3d.real[slab.nonsingular] = 0.
-                    weighted_y3d.imag[slab.nonsingular] *= 2.
-                else:  # even, imag part cancels
-                    weighted_y3d.real[slab.nonsingular] *= 2.
-                    weighted_y3d.imag[slab.nonsingular] = 0.
-
-            # sum up the weighted y in each bin
-            weighted_y3d *= (2.*ell + 1.)
-            ysum[...].real.flat += numpy.bincount(multi_index, weights=weighted_y3d.real.flat, minlength=Nsum.size)
-            if numpy.iscomplexobj(ysum):
-                ysum[...].imag.flat += numpy.bincount(multi_index, weights=weighted_y3d.imag.flat, minlength=Nsum.size)
+        # sum up the weighted y in each bin
+        ysum[...].real.flat += numpy.bincount(multi_index, weights=weighted_y3d.real.flat, minlength=Nsum.size)
+        if numpy.iscomplexobj(ysum):
+            ysum[...].imag.flat += numpy.bincount(multi_index, weights=weighted_y3d.imag.flat, minlength=Nsum.size)
 
  
 
